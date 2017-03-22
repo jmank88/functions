@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/iron-io/functions/api/models"
-	"time"
 )
+
+const reserveTimeout = time.Minute
 
 // New will parse the URL and return the correct MQ implementation.
 func New(mqURL string) (models.MessageQueue, error) {
@@ -20,11 +22,11 @@ func New(mqURL string) (models.MessageQueue, error) {
 	logrus.WithFields(logrus.Fields{"mq": u.Scheme}).Debug("selecting MQ")
 	switch u.Scheme {
 	case "memory":
-		return NewMemoryMQ(time.Minute), nil
+		return NewMemoryMQ(reserveTimeout), nil
 	case "redis":
 		return NewRedisMQ(u)
 	case "bolt":
-		return NewBoltMQ(u)
+		return NewBoltMQ(u, reserveTimeout)
 	}
 	if strings.HasPrefix(u.Scheme, "ironmq") {
 		return NewIronMQ(u), nil

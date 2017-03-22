@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log"
+	"net/url"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -15,6 +17,8 @@ import (
 
 const (
 	testReserveTimeout = 2 * time.Second
+
+	tmpBolt  = "/tmp/func_test_bolt.db"
 )
 
 // A test fixture for generating test message queues.
@@ -41,6 +45,35 @@ var tests = map[string]func(*testing.T){
 				if mq != nil {
 					mq.Close()
 				}
+			},
+		}
+		f.run(t)
+	},
+
+	"bolt": func(t *testing.T) {
+		url, err := url.Parse("bolt://" + tmpBolt)
+		if err != nil {
+			t.Fatalf("failed to parse bolt url: `%v`", err)
+		}
+		var mq models.MessageQueue
+		f := &fixture{
+			newMQFunc: func(t *testing.T) models.MessageQueue {
+				if mq != nil {
+					mq.Close()
+				}
+				os.Remove(tmpBolt)
+				var err error
+				mq, err = NewBoltMQ(url, testReserveTimeout)
+				if err != nil {
+					t.Fatalf("failed to create bolt mq: `%v`", err)
+				}
+				return mq
+			},
+			shutdown: func() {
+				if mq != nil {
+					mq.Close()
+				}
+				os.Remove(tmpBolt)
 			},
 		}
 		f.run(t)
