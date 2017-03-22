@@ -29,7 +29,7 @@ func New(mqURL string) (models.MessageQueue, error) {
 		return NewBoltMQ(u, reserveTimeout)
 	}
 	if strings.HasPrefix(u.Scheme, "ironmq") {
-		return NewIronMQ(u), nil
+		return NewIronMQ(u, reserveTimeout)
 	}
 
 	return nil, fmt.Errorf("mq type not supported %v", u.Scheme)

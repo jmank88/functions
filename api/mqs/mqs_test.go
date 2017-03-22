@@ -3,6 +3,8 @@ package mqs
 import (
 	"bytes"
 	"context"
+	"os/exec"
+	"fmt"
 	"log"
 	"net/url"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
+	ironmq "github.com/iron-io/iron_go3/mq"
 
 	"github.com/iron-io/functions/api/models"
 )
@@ -19,6 +22,7 @@ const (
 	testReserveTimeout = 2 * time.Second
 
 	tmpBolt  = "/tmp/func_test_bolt.db"
+	tmpIron  = "ironmq+http://test:test@127.0.0.1:8080/test"
 )
 
 // A test fixture for generating test message queues.
@@ -74,6 +78,50 @@ var tests = map[string]func(*testing.T){
 					mq.Close()
 				}
 				os.Remove(tmpBolt)
+			},
+		}
+		f.run(t)
+	},
+
+
+	"ironmq": func(t *testing.T) {
+		tryRun(t.Logf, "remove old ironmq container", exec.Command("docker", "rm", "-f", "iron-mq-test"))
+		mustRun(t.Fatalf, "start ironmq container", exec.Command("docker", "run", "--name", "iron-mq-test", "-p", "8080:8080", "-d", "iron/mq:lite"))
+
+		url, err := url.Parse(tmpIron)
+		if err != nil {
+			t.Fatalf("failed to parse ironmq url: `%v`", err)
+		}
+
+		var mq *IronMQ
+
+		timeout := time.After(20 * time.Second)
+		for {
+			mq, err = NewIronMQ(url, testReserveTimeout)
+			if err == nil {
+				break
+			}
+			fmt.Println("failed to connect to ironmq:", err)
+			select {
+			case <-timeout:
+				t.Fatal("timed out waiting for ironmq")
+			case <-time.After(500 * time.Millisecond):
+				continue
+			}
+		}
+
+		f := &fixture{
+			newMQFunc: func(t *testing.T) models.MessageQueue {
+				if err := mq.clear(); err != nil {
+					t.Fatalf("failed to clear queues: %s", err)
+				}
+				return mq
+			},
+			shutdown: func() {
+				if mq != nil {
+					mq.Close()
+				}
+				tryRun(t.Logf, "stop ironmq container", exec.Command("docker", "rm", "-f", "iron-mq-test"))
 			},
 		}
 		f.run(t)
@@ -423,6 +471,32 @@ func (fixture fixture) run(t *testing.T) {
 			t.Log(logBuf.String())
 		}
 	})
+}
+
+func tryRun(logf func(string, ...interface{}), desc string, cmd *exec.Cmd) {
+	var b bytes.Buffer
+	cmd.Stderr = &b
+	if err := cmd.Run(); err != nil {
+		logf("failed to %s: %s", desc, b.String())
+	}
+}
+
+func mustRun(fatalf func(string, ...interface{}), desc string, cmd *exec.Cmd) {
+	var b bytes.Buffer
+	cmd.Stderr = &b
+	if err := cmd.Run(); err != nil {
+		fatalf("failed to %s: %s", desc, b.String())
+	}
+}
+
+func (mq *IronMQ) clear() error {
+	for i := 0; i < 3; i++ {
+		err := mq.queues[i].Clear()
+		if err != nil && !ironmq.ErrQueueNotFound(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 var logBuf bytes.Buffer
