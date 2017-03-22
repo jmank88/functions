@@ -24,7 +24,7 @@ func New(mqURL string) (models.MessageQueue, error) {
 	case "memory":
 		return NewMemoryMQ(reserveTimeout), nil
 	case "redis":
-		return NewRedisMQ(u)
+		return NewRedisMQ(u, reserveTimeout)
 	case "bolt":
 		return NewBoltMQ(u, reserveTimeout)
 	}

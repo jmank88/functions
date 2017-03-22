@@ -3,7 +3,6 @@ package mqs
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -20,9 +19,10 @@ type RedisMQ struct {
 	queueName string
 	ticker    *time.Ticker
 	prefix    string
+	reserveTimeout time.Duration
 }
 
-func NewRedisMQ(url *url.URL) (*RedisMQ, error) {
+func NewRedisMQ(url *url.URL, reserveTimeout time.Duration) (*RedisMQ, error) {
 
 	pool := &redis.Pool{
 		MaxIdle: 4,
@@ -50,6 +50,7 @@ func NewRedisMQ(url *url.URL) (*RedisMQ, error) {
 		pool:   pool,
 		ticker: time.NewTicker(time.Second),
 		prefix: url.Path,
+		reserveTimeout: reserveTimeout,
 	}
 	mq.queueName = mq.k("queue")
 	logrus.WithFields(logrus.Fields{"name": mq.queueName}).Info("Redis initialized with queue name")
@@ -62,14 +63,6 @@ func (mq *RedisMQ) k(s string) string {
 	return mq.prefix + s
 }
 
-func getFirstKeyValue(resp map[string]string) (string, string, error) {
-
-	for key, value := range resp {
-		return key, value, nil
-	}
-	return "", "", errors.New("Blank map")
-}
-
 func (mq *RedisMQ) processPendingReservations(conn redis.Conn) {
 	resp, err := redis.StringMap(conn.Do("ZRANGE", mq.k("timeouts"), 0, 0, "WITHSCORES"))
 	if mq.checkNilResponse(err) || len(resp) == 0 {
@@ -77,38 +70,35 @@ func (mq *RedisMQ) processPendingReservations(conn redis.Conn) {
 	}
 	if err != nil {
 		logrus.WithError(err).Error("Redis command error")
-	}
-
-	reservationId, timeoutString, err := getFirstKeyValue(resp)
-	if err != nil {
-		logrus.WithError(err).Error("error getting kv")
 		return
 	}
 
-	timeout, err := strconv.ParseInt(timeoutString, 10, 64)
-	if err != nil || timeout > time.Now().Unix() {
-		return
-	}
-	response, err := redis.Bytes(conn.Do("HGET", mq.k("timeout_jobs"), reservationId))
-	if mq.checkNilResponse(err) {
-		return
-	}
-	if err != nil {
-		logrus.WithError(err).Error("redis get timeout_jobs error")
-		return
-	}
+	for reservationId, timeoutString := range resp {
+		timeout, err := strconv.ParseInt(timeoutString, 10, 64)
+		if err != nil || timeout > time.Now().Unix() {
+			continue
+		}
+		response, err := redis.Bytes(conn.Do("HGET", mq.k("timeout_jobs"), reservationId))
+		if mq.checkNilResponse(err) {
+			continue
+		}
+		if err != nil {
+			logrus.WithError(err).Error("redis get timeout_jobs error")
+			continue
+		}
 
-	var job models.Task
-	err = json.Unmarshal(response, &job)
-	if err != nil {
-		logrus.WithError(err).Error("error unmarshaling job json")
-		return
-	}
+		var job models.Task
+		err = json.Unmarshal(response, &job)
+		if err != nil {
+			logrus.WithError(err).Error("error unmarshaling job json")
+			continue
+		}
 
-	conn.Do("ZREM", mq.k("timeouts"), reservationId)
-	conn.Do("HDEL", mq.k("timeout_jobs"), reservationId)
-	conn.Do("HDEL", mq.k("reservations"), job.ID)
-	redisPush(conn, mq.queueName, &job)
+		conn.Do("ZREM", mq.k("timeouts"), reservationId)
+		conn.Do("HDEL", mq.k("timeout_jobs"), reservationId)
+		conn.Do("HDEL", mq.k("reservations"), job.ID)
+		redisPush(conn, mq.queueName, &job)
+	}
 }
 
 func (mq *RedisMQ) processDelayedTasks(conn redis.Conn) {
@@ -215,6 +205,9 @@ func (mq *RedisMQ) delayTask(conn redis.Conn, job *models.Task) (*models.Task, e
 }
 
 func (mq *RedisMQ) Push(ctx context.Context, job *models.Task) (*models.Task, error) {
+	if err := validate(job); err != nil {
+		return nil, err
+	}
 	_, log := common.LoggerWithFields(ctx, logrus.Fields{"call_id": job.ID})
 	defer log.Println("Pushed to MQ")
 
@@ -270,17 +263,17 @@ func (mq *RedisMQ) Reserve(ctx context.Context) (*models.Task, error) {
 		return nil, err
 	}
 	reservationId := strconv.FormatInt(response, 10)
-	_, err = conn.Do("ZADD", "timeout:", time.Now().Add(time.Minute).Unix(), reservationId)
+	_, err = conn.Do("ZADD", mq.k("timeouts"), time.Now().Add(mq.reserveTimeout).Unix(), reservationId)
 	if err != nil {
 		return nil, err
 	}
-	_, err = conn.Do("HSET", "timeout", reservationId, resp)
+	_, err = conn.Do("HSET", mq.k("timeout_jobs"), reservationId, resp)
 	if err != nil {
 		return nil, err
 	}
 
 	// Map from job.ID -> reservation ID
-	_, err = conn.Do("HSET", "reservations", job.ID, reservationId)
+	_, err = conn.Do("HSET", mq.k("reservations"), job.ID, reservationId)
 	if err != nil {
 		return nil, err
 	}
@@ -292,23 +285,28 @@ func (mq *RedisMQ) Reserve(ctx context.Context) (*models.Task, error) {
 }
 
 func (mq *RedisMQ) Delete(ctx context.Context, job *models.Task) error {
+	if err := validate(job); err != nil {
+		return err
+	}
 	_, log := common.LoggerWithFields(ctx, logrus.Fields{"call_id": job.ID})
 	defer log.Println("Deleted")
 
 	conn := mq.pool.Get()
 	defer conn.Close()
-	resId, err := conn.Do("HGET", "reservations", job.ID)
+	resId, err := conn.Do("HGET", mq.k("reservations"), job.ID)
+	if err != nil {
+		return err
+	} else if resId == nil {
+		return models.ErrMQTaskNotReserved
+	}
+	_, err = conn.Do("HDEL", mq.k("reservations"), job.ID)
 	if err != nil {
 		return err
 	}
-	_, err = conn.Do("HDEL", "reservations", job.ID)
+	_, err = conn.Do("ZREM", mq.k("timeouts"), resId)
 	if err != nil {
 		return err
 	}
-	_, err = conn.Do("ZREM", "timeout:", resId)
-	if err != nil {
-		return err
-	}
-	_, err = conn.Do("HDEL", "timeout", resId)
+	_, err = conn.Do("HDEL", mq.k("timeout_jobs"), resId)
 	return err
 }

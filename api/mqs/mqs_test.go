@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/garyburd/redigo/redis"
 	ironmq "github.com/iron-io/iron_go3/mq"
 
 	"github.com/iron-io/functions/api/models"
@@ -22,6 +23,7 @@ const (
 	testReserveTimeout = 2 * time.Second
 
 	tmpBolt  = "/tmp/func_test_bolt.db"
+	tmpRedis = "redis://127.0.0.1:6301/"
 	tmpIron  = "ironmq+http://test:test@127.0.0.1:8080/test"
 )
 
@@ -83,6 +85,33 @@ var tests = map[string]func(*testing.T){
 		f.run(t)
 	},
 
+
+	"redis": func(t *testing.T) {
+		url, err := url.Parse(tmpRedis)
+		if err != nil {
+			t.Fatalf("failed to parse redis url: `%v`", err)
+		}
+		startRedis(t.Logf, t.Fatalf)
+		mq, err := NewRedisMQ(url, testReserveTimeout)
+		if err != nil {
+			t.Fatalf("failed to create redis mq: `%v`", err)
+		}
+		f := &fixture{
+			newMQFunc: func(t *testing.T) models.MessageQueue {
+				if err := mq.clear(); err != nil {
+					t.Fatalf("failed to clear queue: %s", err)
+				}
+				return mq
+			},
+			shutdown: func() {
+				if mq != nil {
+					mq.Close()
+				}
+				tryRun(t.Logf, "stop redis container", exec.Command("docker", "rm", "-f", "iron-redis-test"))
+			},
+		}
+		f.run(t)
+	},
 
 	"ironmq": func(t *testing.T) {
 		tryRun(t.Logf, "remove old ironmq container", exec.Command("docker", "rm", "-f", "iron-mq-test"))
@@ -473,6 +502,30 @@ func (fixture fixture) run(t *testing.T) {
 	})
 }
 
+func startRedis(logf, fatalf func(string, ...interface{})) {
+	tryRun(logf, "remove old redis container", exec.Command("docker", "rm", "-f", "iron-redis-test"))
+	mustRun(fatalf, "start redis container", exec.Command("docker", "run", "--name", "iron-redis-test", "-p", "6301:6379", "-d", "redis"))
+	timeout := time.After(20 * time.Second)
+
+	for {
+		c, err := redis.DialURL(tmpRedis)
+		if err == nil {
+			_, err = c.Do("PING")
+			c.Close()
+			if err == nil {
+				break
+			}
+		}
+		fmt.Println("failed to PING redis:", err)
+		select {
+		case <-timeout:
+			fatalf("timed out waiting for redis")
+		case <-time.After(500 * time.Millisecond):
+			continue
+		}
+	}
+}
+
 func tryRun(logf func(string, ...interface{}), desc string, cmd *exec.Cmd) {
 	var b bytes.Buffer
 	cmd.Stderr = &b
@@ -487,6 +540,13 @@ func mustRun(fatalf func(string, ...interface{}), desc string, cmd *exec.Cmd) {
 	if err := cmd.Run(); err != nil {
 		fatalf("failed to %s: %s", desc, b.String())
 	}
+}
+
+func (mq *RedisMQ) clear() error {
+	conn := mq.pool.Get()
+	defer conn.Close()
+	_, err := conn.Do("FLUSHDB")
+	return err
 }
 
 func (mq *IronMQ) clear() error {
